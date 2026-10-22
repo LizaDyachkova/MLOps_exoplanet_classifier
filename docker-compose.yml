@@ -42,12 +42,54 @@ services:
       DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/exoplanet_classifier"
       PORT: 8000
       MLFLOW_TRACKING_URI: "http://mlflow_server:5000"
+      MODEL_NAME: "kepler_exoplanet_classifier"
+      MODEL_ALIAS: "champion"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
     networks:
       - exoplanet_network
     depends_on:
       postgres:
         condition: service_healthy
       mlflow_server:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "src.worker"]
+    expose:
+      - "8001"
+    environment:
+      DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/exoplanet_classifier"
+      MLFLOW_TRACKING_URI: "http://mlflow_server:5000"
+      MODEL_NAME: "kepler_exoplanet_classifier"
+      MODEL_ALIAS: "champion"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      PREFETCH_COUNT: "1"
+      INFERENCE_DELAY_SECONDS: "0.5"
+      WORKER_HEALTH_PORT: "8001"
+    networks:
+      - exoplanet_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow_server:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     deploy:
       resources:
@@ -97,6 +139,25 @@ services:
       timeout: 5s
       retries: 12
       start_period: 40s
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: exoplanet_rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    networks:
+      - exoplanet_network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 networks:
   exoplanet_network:
     driver: bridge
