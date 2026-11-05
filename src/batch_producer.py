@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import os
+import time
 import uuid
 from collections.abc import Generator
 from pathlib import Path
@@ -9,7 +10,7 @@ from typing import Any
 import aiormq.exceptions
 import structlog
 from aio_pika.exceptions import DeliveryError, PublishError
-from faststream.rabbit import Channel, RabbitBroker, RabbitQueue
+from faststream.rabbit import Channel, RabbitBroker
 
 from src.config import (
     PRODUCER_BACKOFF_FACTOR,
@@ -22,8 +23,8 @@ from src.config import (
     QUEUE_OVERFLOW,
     RABBITMQ_URL,
     RAW_DATA_PATH,
-    TASKS_QUEUE_NAME,
 )
+from src.messaging import declare_topology, tasks_queue
 
 logger = structlog.get_logger()
 
@@ -116,15 +117,7 @@ async def publish_batch(
     broker = RabbitBroker(broker_url, default_channel=channel)
     await broker.connect()
 
-    tasks_queue = RabbitQueue(
-        name=TASKS_QUEUE_NAME,
-        durable=True,
-        arguments={
-            "x-max-length": QUEUE_MAX_LENGTH,
-            "x-overflow": QUEUE_OVERFLOW,
-        },
-    )
-    await broker.declare_queue(tasks_queue)
+    await declare_topology(broker)
 
     backoff = AdaptiveBackoff()
     total_published = 0
@@ -139,7 +132,8 @@ async def publish_batch(
             published = False
             while not published:
                 try:
-                    await broker.publish(task, queue=tasks_queue)
+                    task["enqueued_at"] = time.time()
+                    await broker.publish(task, queue=tasks_queue, persist=True)
                     published = True
                     total_published += 1
                     current_delay = backoff.on_success()

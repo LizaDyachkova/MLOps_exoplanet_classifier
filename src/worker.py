@@ -3,29 +3,35 @@ import os
 import time
 from contextlib import asynccontextmanager
 
+import asyncpg
 import structlog
 import uvicorn
 from fastapi import FastAPI
 from faststream import ContextRepo, FastStream
 from faststream.middlewares.acknowledgement.config import AckPolicy
-from faststream.rabbit import Channel, RabbitBroker, RabbitMessage, RabbitQueue
+from faststream.rabbit import Channel, RabbitBroker, RabbitMessage
 
 from src.astrobiology import AstrobiologyEngine
 from src.config import (
-    DLQ_NAME,
+    GRACEFUL_TIMEOUT_SECONDS,
     INFERENCE_DELAY_SECONDS,
     MAX_DELIVERY_ATTEMPTS,
     MODEL_ALIAS,
     MODEL_NAME,
     PREFETCH_COUNT,
-    QUEUE_MAX_LENGTH,
-    QUEUE_OVERFLOW,
     RABBITMQ_URL,
-    TASKS_QUEUE_NAME,
+    RETRY_DELAY_SECONDS,
     WORKER_HEALTH_PORT,
 )
-from src.db import get_db_pool, save_task_failure, save_task_result
+from src.db import (
+    close_db_pool,
+    get_db_pool,
+    init_db,
+    save_task_failure,
+    save_task_result,
+)
 from src.inference import ModelService, load_model_with_retries
+from src.messaging import dlq_queue, tasks_queue
 
 logger = structlog.get_logger()
 
@@ -69,91 +75,52 @@ def compute_sync(
     }
 
 
-# prefetch=1: inference идёт в одном потоке (to_thread), больше одного
-# неподтверждённого сообщения воркер всё равно не обработает параллельно.
 worker_channel = Channel(prefetch_count=PREFETCH_COUNT)
-broker = RabbitBroker(RABBITMQ_URL, default_channel=worker_channel)
-tasks_queue = RabbitQueue(
-    name=TASKS_QUEUE_NAME,
-    durable=True,
-    arguments={
-        "x-max-length": QUEUE_MAX_LENGTH,
-        "x-overflow": QUEUE_OVERFLOW,
-    },
+broker = RabbitBroker(
+    RABBITMQ_URL,
+    default_channel=worker_channel,
+    graceful_timeout=GRACEFUL_TIMEOUT_SECONDS,
 )
-# Терминальная очередь для сообщений, исчерпавших лимит попыток.
-# Без спец-аргументов: никто её не перечитывает автоматически.
-dlq_queue = RabbitQueue(name=DLQ_NAME, durable=True)
 
 
-async def _send_to_retry_or_dlq(
-    message: RabbitMessage, payload: dict, task_id: str, retry_count: int, error: str
-) -> None:
-    """Переслать сообщение на повтор или, если попытки исчерпаны, в DLQ.
-
-    Счётчик попыток храним в заголовке x-retry-count самого сообщения:
-    republish с увеличенным счётчиком + ack оригинала. Так сообщение
-    никогда не "зависает" неподтверждённым и не уходит в бесконечный requeue.
-    """
-    next_attempt = retry_count + 1
-
-    if next_attempt < MAX_DELIVERY_ATTEMPTS:
+async def _handle_failure(task_id: str, attempt: int, exc: Exception) -> None:
+    if attempt < MAX_DELIVERY_ATTEMPTS:
         logger.warning(
             "worker_task_retry_scheduled",
             task_id=task_id,
-            attempt=next_attempt + 1,
+            attempt=attempt,
             max_attempts=MAX_DELIVERY_ATTEMPTS,
-            error=error,
+            error=str(exc),
         )
-        await broker.publish(
-            payload,
-            queue=tasks_queue,
-            headers={"x-retry-count": str(next_attempt)},
-        )
-        await message.ack()
+        await asyncio.sleep(RETRY_DELAY_SECONDS)
         return
 
     logger.error(
-        "worker_task_moved_to_dlq",
-        task_id=task_id,
-        attempts=next_attempt,
-        error=error,
+        "worker_task_moved_to_dlq", task_id=task_id, attempts=attempt, error=str(exc)
     )
     try:
         pool = await get_db_pool()
-        await save_task_failure(pool, task_id, error)
-    except (OSError, RuntimeError, ValueError) as exc:
-        logger.error("worker_db_failure_save_failed", task_id=task_id, error=str(exc))
+        await save_task_failure(pool, task_id, str(exc))
+    except (OSError, RuntimeError, ValueError, asyncpg.PostgresError) as db_exc:
+        logger.error(
+            "worker_db_failure_save_failed", task_id=task_id, error=str(db_exc)
+        )
 
-    await broker.publish(payload, queue=dlq_queue)
-    await message.ack()
 
-
-@broker.subscriber(tasks_queue, channel=worker_channel, ack_policy=AckPolicy.MANUAL)
+@broker.subscriber(
+    tasks_queue, channel=worker_channel, ack_policy=AckPolicy.NACK_ON_ERROR
+)
 async def process_task(payload: dict, message: RabbitMessage) -> None:
-    """Обработчик задач из очереди.
+    task_id = str(payload.get("task_id", "anonymous"))
+    attempt = int(message.headers.get("x-delivery-count") or 0) + 1
+    started_at = time.time()
 
-    ack_policy=MANUAL выбран осознанно: сообщение подтверждается только
-    после того, как результат успешно записан в БД (или после того, как
-    оно переотправлено на повтор / в DLQ). Если воркер упадёт во время
-    inference, сообщение останется неподтверждённым и будет повторно
-    доставлено другому воркеру — данные не теряются. Повторная доставка
-    безопасна благодаря идемпотентному UPSERT в БД по task_id.
-    """
-    global _model_service
-    task_id = payload.get("task_id", "anonymous")
-    features = (
-        payload.get("features")
-        if isinstance(payload.get("features"), dict)
-        else payload
-    )
-    retry_count = int(message.headers.get("x-retry-count", 0))
-
-    logger.info("worker_task_received", task_id=task_id, attempt=retry_count + 1)
+    logger.info("worker_task_received", task_id=task_id, attempt=attempt)
 
     try:
-        if _model_service is None:
-            raise RuntimeError("Model service is not loaded from MLflow")
+        features = payload.get("features")
+        if not isinstance(features, dict):
+            raise ValueError("Message has no features object")
 
         result = await asyncio.to_thread(
             compute_sync,
@@ -161,17 +128,6 @@ async def process_task(payload: dict, message: RabbitMessage) -> None:
             features,
             INFERENCE_DELAY_SECONDS,
         )
-    except (ValueError, RuntimeError) as exc:
-        logger.warning(
-            "worker_task_failed",
-            task_id=task_id,
-            attempt=retry_count + 1,
-            error=str(exc),
-        )
-        await _send_to_retry_or_dlq(message, payload, task_id, retry_count, str(exc))
-        return
-
-    try:
         pool = await get_db_pool()
         await save_task_result(
             pool,
@@ -184,18 +140,20 @@ async def process_task(payload: dict, message: RabbitMessage) -> None:
             is_rocky=result.get("is_rocky"),
             planet_category=result.get("planet_category"),
         )
-    except (OSError, RuntimeError, ValueError) as exc:
-        logger.error("worker_db_save_failed", task_id=task_id, error=str(exc))
-        await _send_to_retry_or_dlq(message, payload, task_id, retry_count, str(exc))
-        return
+    except Exception as exc:
+        await _handle_failure(task_id, attempt, exc)
+        raise
 
+    finished_at = time.time()
+    enqueued_at = payload.get("enqueued_at")
     logger.info(
         "worker_task_completed",
         task_id=task_id,
         prediction=result.get("prediction"),
         esi_percent=result.get("esi_percent"),
+        process_sec=round(finished_at - started_at, 3),
+        total_sec=round(finished_at - enqueued_at, 3) if enqueued_at else None,
     )
-    await message.ack()
 
 
 @asynccontextmanager
@@ -210,19 +168,17 @@ async def lifespan(context: ContextRepo):
     )
 
     _model_service = await load_model_with_retries()
-    if _model_service:
-        logger.info(
-            "worker_model_loaded",
-            model_name=_model_service.model_name,
-            version=_model_service.model_version,
-            alias=MODEL_ALIAS,
-        )
-        context.set_global("model_service", _model_service)
-    else:
-        logger.warning(
-            "worker_model_load_failed",
-            detail="Proceeding without model; will fail on inference",
-        )
+    if _model_service is None:
+        raise RuntimeError(f"Model {MODEL_NAME}@{MODEL_ALIAS} is not loaded")
+
+    logger.info(
+        "worker_model_loaded",
+        model_name=_model_service.model_name,
+        version=_model_service.model_version,
+        alias=MODEL_ALIAS,
+    )
+    context.set_global("model_service", _model_service)
+    await init_db()
 
     server_task = None
     if os.getenv("ENABLE_WORKER_HEALTH_SERVER", "true").lower() in ("true", "1"):
@@ -250,6 +206,7 @@ async def lifespan(context: ContextRepo):
                 await server_task
             except (asyncio.CancelledError, OSError, RuntimeError):
                 pass
+        await close_db_pool()
         logger.info("worker_shutdown_complete")
 
 

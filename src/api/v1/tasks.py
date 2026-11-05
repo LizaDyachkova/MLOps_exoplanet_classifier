@@ -1,35 +1,29 @@
+import asyncio
+import time
 import uuid
 from typing import Any
 
 import aiormq.exceptions
+import asyncpg
 import structlog
 from aio_pika.exceptions import DeliveryError, PublishError
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
-from faststream.rabbit import Channel, RabbitBroker, RabbitQueue
+from faststream.rabbit import Channel, RabbitBroker
 from pydantic import BaseModel, Field
 
 from src.config import (
-    QUEUE_MAX_LENGTH,
-    QUEUE_OVERFLOW,
+    PUBLISH_TIMEOUT_SECONDS,
     RABBITMQ_URL,
-    TASKS_QUEUE_NAME,
+    RETRY_AFTER_SECONDS,
 )
 from src.db import create_pending_task, get_db_pool, get_task
+from src.messaging import declare_topology, tasks_queue
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/tasks", tags=["Tasks"])
 
-RETRY_AFTER_SECONDS = 5
-
-tasks_queue = RabbitQueue(
-    name=TASKS_QUEUE_NAME,
-    durable=True,
-    arguments={
-        "x-max-length": QUEUE_MAX_LENGTH,
-        "x-overflow": QUEUE_OVERFLOW,
-    },
-)
+_broker_lock = asyncio.Lock()
 
 
 class TaskCreateRequest(BaseModel):
@@ -72,14 +66,15 @@ class TaskDetailResponse(BaseModel):
 
 
 async def get_or_create_broker(request: Request) -> RabbitBroker:
-    broker: RabbitBroker | None = getattr(request.app.state, "rabbit_broker", None)
-    if broker is None:
-        channel = Channel(publisher_confirms=True)
-        broker = RabbitBroker(RABBITMQ_URL, default_channel=channel)
-        await broker.connect()
-        await broker.declare_queue(tasks_queue)
-        request.app.state.rabbit_broker = broker
-    return broker
+    async with _broker_lock:
+        broker: RabbitBroker | None = getattr(request.app.state, "rabbit_broker", None)
+        if broker is None:
+            channel = Channel(publisher_confirms=True)
+            broker = RabbitBroker(RABBITMQ_URL, default_channel=channel)
+            await broker.connect()
+            await declare_topology(broker)
+            request.app.state.rabbit_broker = broker
+        return broker
 
 
 @router.post(
@@ -100,11 +95,20 @@ async def get_or_create_broker(request: Request) -> RabbitBroker:
 )
 async def create_task(payload: TaskCreateRequest, request: Request) -> Response:
     task_id = str(uuid.uuid4())
-    message = {"task_id": task_id, "features": payload.features}
+    message = {
+        "task_id": task_id,
+        "features": payload.features,
+        "enqueued_at": time.time(),
+    }
 
     try:
         broker = await get_or_create_broker(request)
-        await broker.publish(message, queue=tasks_queue)
+        await broker.publish(
+            message,
+            queue=tasks_queue,
+            persist=True,
+            timeout=PUBLISH_TIMEOUT_SECONDS,
+        )
     except (DeliveryError, PublishError, aiormq.exceptions.DeliveryError) as exc:
         logger.warning(
             "load_shedding_503_triggered",
@@ -120,7 +124,7 @@ async def create_task(payload: TaskCreateRequest, request: Request) -> Response:
                 "retry_after": RETRY_AFTER_SECONDS,
             },
         )
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, aiormq.exceptions.AMQPError) as exc:
         logger.error("rabbit_publish_failed", error=str(exc))
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -134,7 +138,7 @@ async def create_task(payload: TaskCreateRequest, request: Request) -> Response:
     try:
         pool = await get_db_pool()
         await create_pending_task(pool, task_id, payload.features)
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, asyncpg.PostgresError) as exc:
         logger.warning(
             "db_task_pending_creation_warning", task_id=task_id, error=str(exc)
         )
@@ -151,12 +155,12 @@ async def create_task(payload: TaskCreateRequest, request: Request) -> Response:
 
 
 @router.get("/{task_id}", response_model=TaskDetailResponse)
-async def get_task_status(task_id: str) -> dict[str, Any]:
+async def get_task_status(task_id: uuid.UUID) -> dict[str, Any]:
     try:
         pool = await get_db_pool()
         task = await get_task(pool, task_id)
-    except (OSError, RuntimeError) as exc:
-        logger.error("db_get_task_failed", task_id=task_id, error=str(exc))
+    except (OSError, RuntimeError, asyncpg.PostgresError) as exc:
+        logger.error("db_get_task_failed", task_id=str(task_id), error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Database error while fetching task status",

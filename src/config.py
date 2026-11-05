@@ -1,3 +1,4 @@
+import math
 import os
 import tomllib
 from pathlib import Path
@@ -35,12 +36,18 @@ QUEUE_MAX_LENGTH = int(os.getenv("QUEUE_MAX_LENGTH", "50"))
 QUEUE_OVERFLOW = os.getenv("QUEUE_OVERFLOW", "reject-publish")
 DLQ_NAME = os.getenv("DLQ_NAME", "tasks_dlq")
 MAX_DELIVERY_ATTEMPTS = int(os.getenv("MAX_DELIVERY_ATTEMPTS", "3"))
+RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "1"))
+GRACEFUL_TIMEOUT_SECONDS = float(os.getenv("GRACEFUL_TIMEOUT_SECONDS", "15"))
+PUBLISH_TIMEOUT_SECONDS = float(os.getenv("PUBLISH_TIMEOUT_SECONDS", "2"))
+RETRY_AFTER_SECONDS = max(
+    1, math.ceil(max(QUEUE_MAX_LENGTH, 0) * INFERENCE_DELAY_SECONDS * 0.2)
+)
 RAW_DATA_PATH = Path(
     os.getenv("RAW_DATA_PATH", str(BASE_DIR / "data" / "raw" / "cumulative.csv"))
 )
 PRODUCER_INITIAL_DELAY = float(os.getenv("PRODUCER_INITIAL_DELAY", "0.001"))
 PRODUCER_MIN_DELAY = float(os.getenv("PRODUCER_MIN_DELAY", "0.0001"))
-PRODUCER_MAX_DELAY = float(os.getenv("PRODUCER_MAX_DELAY", "5.0"))
+PRODUCER_MAX_DELAY = float(os.getenv("PRODUCER_MAX_DELAY", "1.0"))
 PRODUCER_BACKOFF_FACTOR = float(os.getenv("PRODUCER_BACKOFF_FACTOR", "1.5"))
 PRODUCER_BACKOFF_STEP = float(os.getenv("PRODUCER_BACKOFF_STEP", "0.05"))
-PRODUCER_RECOVERY_FACTOR = float(os.getenv("PRODUCER_RECOVERY_FACTOR", "0.9"))
+PRODUCER_RECOVERY_FACTOR = float(os.getenv("PRODUCER_RECOVERY_FACTOR", "0.7"))

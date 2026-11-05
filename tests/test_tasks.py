@@ -40,6 +40,7 @@ def test_create_task_success():
         )
 
     assert response.status_code == 202
+    assert mock_broker.publish.call_args.kwargs["persist"] is True
     data = response.json()
     assert "task_id" in data
     assert data["status"] == "PENDING"
@@ -100,6 +101,19 @@ def test_create_task_broker_connection_error_503():
     assert response.status_code == 503
     assert response.headers.get("retry-after") == "5"
     mock_create_db.assert_not_called()
+
+
+def test_create_task_empty_features_rejected():
+    assert client.post("/api/v1/tasks", json={"features": {}}).status_code == 422
+
+
+def test_process_endpoint_removed():
+    response = client.post("/process", json={"features": {"koi_period": 1.0}})
+    assert response.status_code == 404
+
+
+def test_get_task_status_invalid_id():
+    assert client.get("/api/v1/tasks/not-a-uuid").status_code == 422
 
 
 def test_get_task_status_found():

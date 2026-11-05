@@ -41,16 +41,13 @@ services:
     environment:
       DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/exoplanet_classifier"
       PORT: 8000
-      MLFLOW_TRACKING_URI: "http://mlflow_server:5000"
-      MODEL_NAME: "kepler_exoplanet_classifier"
-      MODEL_ALIAS: "champion"
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      QUEUE_MAX_LENGTH: "${QUEUE_MAX_LENGTH:-50}"
+      INFERENCE_DELAY_SECONDS: "${INFERENCE_DELAY_SECONDS:-0.5}"
     networks:
       - exoplanet_network
     depends_on:
       postgres:
-        condition: service_healthy
-      mlflow_server:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
@@ -71,6 +68,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     command: ["python", "-m", "src.worker"]
+    stop_grace_period: 20s
     expose:
       - "8001"
     environment:
@@ -79,8 +77,9 @@ services:
       MODEL_NAME: "kepler_exoplanet_classifier"
       MODEL_ALIAS: "champion"
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
-      PREFETCH_COUNT: "1"
-      INFERENCE_DELAY_SECONDS: "0.5"
+      PREFETCH_COUNT: "${PREFETCH_COUNT:-1}"
+      INFERENCE_DELAY_SECONDS: "${INFERENCE_DELAY_SECONDS:-0.5}"
+      QUEUE_MAX_LENGTH: "${QUEUE_MAX_LENGTH:-50}"
       WORKER_HEALTH_PORT: "8001"
     networks:
       - exoplanet_network
@@ -143,6 +142,7 @@ services:
   rabbitmq:
     image: rabbitmq:3-management
     container_name: exoplanet_rabbitmq
+    hostname: rabbitmq
     restart: unless-stopped
     ports:
       - "5672:5672"
@@ -150,6 +150,8 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
     networks:
       - exoplanet_network
     healthcheck:
@@ -165,3 +167,4 @@ networks:
 volumes:
   postgres_data:
   mlflow_db_data:
+  rabbitmq_data:
